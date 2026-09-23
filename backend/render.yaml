@@ -1,0 +1,61 @@
+services:
+  - type: web
+    name: luca-ai
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.11.0
+      - key: OPENROUTER_KEY
+        syncValue: false
+      - key: OPENROUTER_KEY_2
+        syncValue: false
+      - key: CROWLLM_KEY
+        syncValue: false
+      - key: LOGFARE_KEY
+        syncValue: false
+      - key: UGLYCAT_KEY
+        syncValue: false
+      - key: AGNES_KEY
+        syncValue: false
+      - key: FXQIDIAN_KEY
+        syncValue: false
+      - key: GOOGLE_KEY
+        syncValue: false
+      - key: ZYDIT_KEY
+        syncValue: false
+      - key: YJS_KEY
+        syncValue: false
+      - key: UNOROUTER_KEY
+        syncValue: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: SMTP_HOST
+        syncValue: false
+      - key: SMTP_PORT
+        syncValue: false
+      - key: SMTP_USER
+        syncValue: false
+      - key: SMTP_PASS
+        syncValue: false
+      - key: EMAIL_FROM
+        syncValue: false
+      - key: EMAIL_USER
+        syncValue: false
+      - key: EMAIL_PASS
+        syncValue: false
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        syncValue: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        syncValue: false
+      - key: GITHUB_OAUTH_CLIENT_ID
+        syncValue: false
+      - key: GITHUB_OAUTH_CLIENT_SECRET
+        syncValue: false
+      - key: OAUTH_REDIRECT
+        syncValue: false
+      - key: FRONTEND_URL
+        syncValue: false

@@ -1,0 +1,13 @@
+{
+  "name": "Luca AI",
+  "short_name": "Luca",
+  "description": "Next-generation intelligence for engineering, reasoning, and research.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0b0d0e",
+  "theme_color": "#0b0d0e",
+  "icons": [
+    { "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Luca AI</title>
+    <meta name="description" content="Luca AI — next-generation intelligence for engineering, reasoning, and research. Flash answers, deep thinking on demand." />
+    <meta name="theme-color" content="#0b0d0e" />
+    <link rel="canonical" href="https://160spiral-bit.github.io/luca-ai-web/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Luca AI" />
+    <meta property="og:description" content="Flash answers, deep thinking on demand." />
+    <meta property="og:url" content="https://160spiral-bit.github.io/luca-ai-web/" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Luca AI" />
+    <meta name="twitter:description" content="Flash answers, deep thinking on demand." />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <script>
+      (function () {
+        var theme = null;
+        try {
+          var raw = localStorage.getItem("luca-onboarding");
+          if (raw) { var p = JSON.parse(raw); if (p && p.complete === true && p.theme) theme = p.theme; }
+          if (!theme) { var s = localStorage.getItem("luca-settings"); if (s) { var sp = JSON.parse(s); if (sp && sp.theme) theme = sp.theme; } }
+        } catch (e) {}
+        if (!theme) { theme = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"; }
+        document.documentElement.setAttribute("data-theme", theme);
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./src/main.tsx"></script>
+  </body>
+</html>
