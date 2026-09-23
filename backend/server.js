@@ -2073,7 +2073,7 @@ app.get('/api/models', (_req, res) => {
 
 // Deploy fingerprint: bump on every behavior-changing push so we can tell
 // what's actually live (Render gives no other signal).
-const SERVER_REV = '2026-09-22T05-30-followup-failover';
+const SERVER_REV = '2026-09-23-intent-slamdunks';
 app.get('/api/health', (_req, res) => res.json({ ok: true, rev: SERVER_REV }));
 
 // Debug route: visit http://localhost:3000/api/test to see which providers work.
