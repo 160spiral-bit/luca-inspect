@@ -14,6 +14,7 @@ interface Props {
   onToast: (m: string) => void;
   onEditDraft: (text: string) => void;
   onOpenArtifact: (id: string) => void;
+  onPreviewHtml: (title: string, html: string) => void;
 }
 
 function ErrorState({ modelLabel, onRetry, onEditLastMessage }: { modelLabel: string; onRetry: () => void; onEditLastMessage: () => void }) {
@@ -145,11 +146,12 @@ function useThrottled<T>(value: T, ms = 33): T {
   return v;
 }
 
-const AssistantMsg = memo(function AssistantMsg({ msg, session, isLast, onRegenerate, onVersion, onToast, onSelect, onEditDraft, onOpenArtifact }: {
+const AssistantMsg = memo(function AssistantMsg({ msg, session, isLast, onRegenerate, onVersion, onToast, onSelect, onEditDraft, onOpenArtifact, onPreviewHtml }: {
   msg: LucaMessage; session: Session; isLast: boolean;
   onRegenerate: (sid: string, uid: string) => void;
   onVersion: (sid: string, uid: string, i: number) => void;
   onOpenArtifact: (id: string) => void;
+  onPreviewHtml: (title: string, html: string) => void;
   onToast: (m: string) => void;
   onSelect: (text: string) => void;
   onEditDraft: (text: string) => void;
@@ -268,6 +270,16 @@ const AssistantMsg = memo(function AssistantMsg({ msg, session, isLast, onRegene
                 ))}
               </span>
             )}
+            {!msg.streaming && shown && (() => {
+              const m = /```html\n([\s\S]*?)```/.exec(shown);
+              const html = m && m[1] ? m[1].trim() : "";
+              if (html.length < 800) return null;
+              return (
+                <span className="artifact-links">
+                  <button className="mini-btn" onClick={() => onPreviewHtml("HTML preview", html)}>Open preview</button>
+                </span>
+              );
+            })()}
             {showVersion && (
               <span className="version-nav">
                 <button className="icon-btn" disabled={idx === 0}
@@ -351,7 +363,7 @@ const UserMsg = memo(function UserMsg({ msg, session, onEditResend, onToast }: {
   );
 }, (a, b) => a.msg === b.msg && a.session.id === b.session.id);
 
-export default function ChatArea({ session, settings, onSuggestion, onRegenerate, onEditResend, onVersion, onToast, onEditDraft, onOpenArtifact }: Props) {
+export default function ChatArea({ session, settings, onSuggestion, onRegenerate, onEditResend, onVersion, onToast, onEditDraft, onOpenArtifact, onPreviewHtml }: Props) {
   const threadRef = useRef<HTMLDivElement>(null);
   const prevKey = useRef("");
   // Scroll-down pill: visible only when the user has scrolled well above the
@@ -392,7 +404,7 @@ export default function ChatArea({ session, settings, onSuggestion, onRegenerate
   });
   const renderMsg = (m: LucaMessage, i: number) => m.role === "user"
     ? <UserMsg key={m.uid} msg={m} session={session!} onEditResend={onEditResend} onToast={onToast} />
-    : <AssistantMsg key={m.uid} msg={m} session={session!} isLast={i === msgs.length - 1} onRegenerate={onRegenerate} onVersion={onVersion} onToast={onToast} onSelect={onSuggestion} onEditDraft={onEditDraft} onOpenArtifact={onOpenArtifact} />;
+    : <AssistantMsg key={m.uid} msg={m} session={session!} isLast={i === msgs.length - 1} onRegenerate={onRegenerate} onVersion={onVersion} onToast={onToast} onSelect={onSuggestion} onEditDraft={onEditDraft} onOpenArtifact={onOpenArtifact} onPreviewHtml={onPreviewHtml} />;
   // Screen-reader announcements for streaming — never on the message text
   // itself (that would read every token).
   const streaming = msgs.some((m) => m.streaming);

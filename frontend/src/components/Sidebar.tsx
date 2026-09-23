@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import * as Dialog from "@radix-ui/react-dialog";
 import { Check, Pencil, Pin, PinOff, Plus, Search, Settings as SettingsIcon, ShieldCheck, Trash2, X, PanelLeft } from "lucide-react";
 import type { AuthUser, Profile, Session } from "../lib/store";
 
@@ -68,13 +69,6 @@ export default function Sidebar(p: Props) {
     .sort((a, b) => Number(b.pinned || false) - Number(a.pinned || false) || (b.updatedAt || 0) - (a.updatedAt || 0));
   const commitRename = () => { if (renamingId && renameValue.trim()) p.onRename(renamingId, renameValue.trim()); setRenamingId(null); };
   const lastActivity = (s: Session) => s.messages.length ? (s.messages[s.messages.length - 1]?.ts || s.updatedAt || 0) : (s.createdAt || 0);
-
-  useEffect(() => {
-    if (!confirmDelete) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setConfirmDelete(null); };
-    document.addEventListener("keydown", onKey);
-    return () => { document.removeEventListener("keydown", onKey); };
-  }, [confirmDelete]);
 
   const displayName = (p.profile?.name || p.authUser?.name || "User").trim() || "User";
 
@@ -177,23 +171,29 @@ export default function Sidebar(p: Props) {
         </div>
       </aside>
       {confirmDelete && (
-        <div className="overlay open" onClick={() => setConfirmDelete(null)}>
-          <div className="modal" role="alertdialog" aria-modal="true" aria-label="Delete chat" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head"><h2>Delete chat?</h2></div>
-            <p style={{ fontSize: 13.5, color: "var(--mut)", margin: "0 0 18px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              “{confirmDelete.title}” will be gone for good.
-            </p>
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button className="btn-ghost" style={{ width: "auto", padding: "9px 18px" }} onClick={() => setConfirmDelete(null)}>Cancel</button>
-              <button
-                className="btn-ghost btn-danger" style={{ width: "auto", padding: "9px 18px" }}
-                onClick={() => { p.onDelete(confirmDelete.id); setConfirmDelete(null); }}
-              >
-                Delete
-              </button>
-            </div>
-          </div>
-        </div>
+        <Dialog.Root
+          open
+          onOpenChange={(open) => { if (!open) setConfirmDelete(null); }}
+        >
+          <Dialog.Portal>
+            <Dialog.Overlay className="scrim show" />
+            <Dialog.Content className="modal show" aria-label="Delete chat">
+              <div className="modal-head"><h2>Delete chat?</h2></div>
+              <p style={{ fontSize: 13.5, color: "var(--mut)", margin: "0 0 18px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                “{confirmDelete.title}” will be gone for good.
+              </p>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <Dialog.Close className="btn-ghost" style={{ width: "auto", padding: "9px 18px" }}>Cancel</Dialog.Close>
+                <button
+                  className="btn-ghost btn-danger" style={{ width: "auto", padding: "9px 18px" }}
+                  onClick={() => { p.onDelete(confirmDelete.id); setConfirmDelete(null); }}
+                >
+                  Delete
+                </button>
+              </div>
+            </Dialog.Content>
+          </Dialog.Portal>
+        </Dialog.Root>
       )}
     </>
   );

@@ -5,9 +5,18 @@ import type { AuthUser, Settings, Source, Tier } from "./store";
 
 const FALLBACK = "https://luca-ai-iozy.onrender.com";
 // backendUrl is user-writable in localStorage with no UI — an XSS foothold
-// could repoint it (and the Bearer header) at an attacker server. Only the
-// env default, the production origin, and loopback are ever used.
-const ALLOWED_HOSTS = new Set(["luca-ai-iozy.onrender.com", "localhost", "127.0.0.1"]);
+// could repoint it (and the Bearer header) at an attacker server. Only hosts
+// on this allowlist are ever used. The build-time VITE_API_URL extends the
+// list so a new backend origin isn't silently ignored (the old config trap).
+const ENV_HOSTS: string[] = (() => {
+  try {
+    const env = import.meta.env.VITE_API_URL as string | undefined;
+    return env ? [new URL(env).hostname] : [];
+  } catch {
+    return [];
+  }
+})();
+const ALLOWED_HOSTS = new Set(["luca-ai-iozy.onrender.com", "localhost", "127.0.0.1", ...ENV_HOSTS]);
 function safeBase(url: string): string | null {
   try {
     const u = new URL(url);

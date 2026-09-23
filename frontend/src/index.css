@@ -518,6 +518,16 @@ body.no-times .msg-time { display: none; }
 .md th, .md td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
 .md thead th { background: var(--s1); font-weight: 600; }
 .md img { max-width: 100%; border-radius: 12px; border: 1px solid var(--line); }
+.md img.md-img { display: block; }
+.img-gate {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  width: 100%; max-width: 420px; padding: 10px 14px; margin: 12px 0;
+  background: var(--s1); border: 1px dashed var(--line2); border-radius: 12px;
+  cursor: pointer; text-align: left;
+}
+.img-gate:hover { border-color: var(--txt); }
+.img-gate-domain { font-size: 13px; font-weight: 600; color: var(--txt); }
+.img-gate-hint { font-size: 11.5px; color: var(--fnt); }
 .md .katex-display, .math-display { overflow-x: auto; padding: 6px 0; }
 .cite { font-size: 10px; color: var(--fnt); padding: 0 1px; }
 .cite a { color: inherit; text-decoration: none; }

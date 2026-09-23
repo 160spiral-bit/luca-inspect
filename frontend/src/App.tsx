@@ -72,7 +72,6 @@ export default function App({ namespace: _namespace }: { namespace: string }) {
   const saveTimer = useRef<number | undefined>(undefined);
 
   const activeSession = sessions.find((s) => s.id === activeId) || null;
-  const isStreaming = streaming !== null;
   // FIX 2a: generation state is scoped to its session. The composer only
   // shows "stop" when the running stream belongs to the open chat.
   const streamingActive = !!streaming && streaming.sessionId === activeId;
@@ -180,6 +179,18 @@ export default function App({ namespace: _namespace }: { namespace: string }) {
     return () => window.clearTimeout(t);
   }, [artifacts, storageFullToast]);
   const openArtifact = useCallback((id: string) => { setActiveArtifactId(id); setMobileNav(false); }, []);
+  // Client-side previews: the backend doesn't emit artifact events, so large
+  // ```html blocks get an "Open preview" button that materializes a local
+  // artifact (persisted like the rest). No server round-trip involved.
+  const previewHtml = useCallback((title: string, html: string) => {
+    const id = uid();
+    setArtifacts((prev) => ({
+      ...prev,
+      [id]: { id, artifactType: "html", title: title || "HTML preview", versions: [{ version: 1, content: html, createdAt: new Date().toISOString() }] },
+    }));
+    setMobileNav(false);
+    setActiveArtifactId(id);
+  }, []);
   // TEMPORARY layout debugger (?debug=layout): outlines each container and
   // prints real rects so centering can be verified without guesswork.
   useEffect(() => {
@@ -468,8 +479,10 @@ export default function App({ namespace: _namespace }: { namespace: string }) {
   // Model choice is PER-CHAT and persists on the chat record. New chats
   // inherit the global default; the composer control edits the open chat.
   const sendMessage = useCallback((text: string, attachments: Attachment[]) => {
-    if (streamingRef.current) return;
     let sid = activeIdRef.current;
+    // Only the actively-streaming chat is locked; other chats (or a new one)
+    // can always send — the backend streams them independently.
+    if (sid && streamingRef.current && streamingRef.current === sid) return;
     let baseMsgs: LucaMessage[] = [];
     const liveSession = sid ? sessionsRef.current.find((s) => s.id === sid) || null : null;
     if (!sid || !liveSession) {
@@ -498,10 +511,12 @@ export default function App({ namespace: _namespace }: { namespace: string }) {
     setSessions((p) => p.map((s) => (s.id === sid ? { ...s, tier: t } : s)));
   }, []);
 
-  const streamingRef = useRef(isStreaming);
-  useEffect(() => { streamingRef.current = isStreaming; }, [isStreaming]);
+  // Streams are per-chat on the backend (switching chats doesn't abort), so
+  // only block actions in the chat that's actually streaming — never others.
+  const streamingRef = useRef<string | null>(null);
+  useEffect(() => { streamingRef.current = streaming ? streaming.sessionId : null; }, [streaming]);
   const regenerate = useCallback((sid: string, mu: string) => {
-    if (streamingRef.current) return;
+    if (streamingRef.current && streamingRef.current === sid) return;
     const s = sessionsRef.current.find((x) => x.id === sid);
     if (!s) return;
     const idx = s.messages.findIndex((m) => m.uid === mu);
@@ -520,7 +535,7 @@ export default function App({ namespace: _namespace }: { namespace: string }) {
   }, [tier, runStream]);
 
   const editAndResend = useCallback((sid: string, mu: string, text: string) => {
-    if (streamingRef.current) return;
+    if (streamingRef.current && streamingRef.current === sid) return;
     const s = sessionsRef.current.find((x) => x.id === sid);
     if (!s) return;
     const idx = s.messages.findIndex((m) => m.uid === mu);
@@ -745,7 +760,7 @@ export default function App({ namespace: _namespace }: { namespace: string }) {
           <div className="conv">
             <ChatArea session={activeSession} profile={profile} settings={settings}
               onSuggestion={sendSuggestion} onRegenerate={regenerate}
-              onEditResend={editAndResend} onVersion={setVersion} onToast={toast} onEditDraft={handleEditDraft} onOpenArtifact={openArtifact} />
+              onEditResend={editAndResend} onVersion={setVersion} onToast={toast} onEditDraft={handleEditDraft} onOpenArtifact={openArtifact} onPreviewHtml={previewHtml} />
             <Composer streaming={streamingActive} onSend={sendMessage} onStop={() => abortRef.current?.abort()}
               tier={activeSession?.tier || tier}
               onTierChange={(t) => { if (activeSession) setChatTier(activeSession.id, t); else setTier(t); }}

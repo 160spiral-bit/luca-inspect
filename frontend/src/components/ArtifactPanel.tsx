@@ -6,14 +6,25 @@ const Mermaid = lazy(() => import("./Mermaid").then((m) => ({ default: m.Mermaid
 function CodeView({ code, language }: { code: string; language: string }) {
   return <pre style={{ margin: 0, padding: 16, overflow: "auto" }}><code>{code}</code><div style={{ fontSize: 11, color: "var(--ink-3)", marginTop: 8 }}>{language}</div></pre>;
 }
+// The sandbox attribute already contains scripts (no allow-same-origin, so no
+// parent DOM/storage access). This meta tag is defense-in-depth for engines
+// where the iframe csp attribute is unsupported (Firefox/Safari): no network,
+// no plugins, images data/blob only.
+const ARTIFACT_CSP = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'unsafe-inline\'; style-src \'unsafe-inline\'; img-src data: blob:; font-src data:; connect-src \'none\'; media-src data: blob:">';
+function withCsp(content: string): string {
+  if (/<head[^>]*>/i.test(content)) return content.replace(/<head[^>]*>/i, (m) => `${m}${ARTIFACT_CSP}`);
+  if (/<html[^>]*>/i.test(content)) return content.replace(/<html[^>]*>/i, (m) => `${m}<head>${ARTIFACT_CSP}</head>`);
+  return `<head>${ARTIFACT_CSP}</head>` + content;
+}
 function ArtifactPreview({ type, content }: { type: string; content: string }) {
   if (type === "html" || type === "svg") {
+    const doc = type === "html" ? withCsp(content) : content;
     return (
       <iframe
         sandbox="allow-scripts"
         referrerPolicy="no-referrer"
         {...{ csp: "default-src 'none'; style-src 'unsafe-inline'; img-src data:" }}
-        srcDoc={content}
+        srcDoc={doc}
         className="artifact-iframe"
         title="Artifact preview"
       />
