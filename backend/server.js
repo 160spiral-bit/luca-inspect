@@ -39,7 +39,56 @@ try {
 }
 
 const app = express();
+// Behind Render's proxy (1 hop): trust X-Forwarded-For so req.ip is real.
+// Without this, any client can spoof x-forwarded-for and evade IP checks.
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '10mb' }));
+// Minimal security headers (no helmet dep).
+app.use((req, res, next) => {
+  res.header('X-Content-Type-Options', 'nosniff');
+  res.header('X-Frame-Options', 'DENY');
+  res.header('Referrer-Policy', 'no-referrer');
+  next();
+});
+
+// In-process rate limiter (no dep): per-key fixed windows with periodic sweep
+// so idle keys don't leak memory. Keyed by authed user id when available,
+// otherwise req.ip (trustworthy only because trust proxy is set above).
+const rateBuckets = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateBuckets) {
+    if (now - v.start > v.windowMs * 2) rateBuckets.delete(k);
+  }
+}, 60_000).unref();
+function rateLimit({ windowMs, max, message }) {
+  return (req, res, next) => {
+    let id = null;
+    try {
+      const auth = req.headers.authorization;
+      if (auth && auth.startsWith('Bearer ')) {
+        const decoded = verifyToken(auth.slice(7));
+        if (decoded && decoded.id) id = 'u:' + decoded.id;
+      }
+    } catch {}
+    const key = (id || 'ip:' + (req.ip || req.socket.remoteAddress || '?')) + ':' + (message || 'default');
+    const now = Date.now();
+    let b = rateBuckets.get(key);
+    if (!b || now - b.start > windowMs) b = { start: now, count: 0, windowMs };
+    b.count++;
+    rateBuckets.set(key, b);
+    if (b.count > max) {
+      res.header('Retry-After', String(Math.ceil((b.start + windowMs - now) / 1000)));
+      return res.status(429).json({ error: message || 'Too many requests — slow down.' });
+    }
+    next();
+  };
+}
+const limitAuth = rateLimit({ windowMs: 15 * 60_000, max: 30, message: 'Too many auth attempts — try again later.' });
+const limitOTP = rateLimit({ windowMs: 10 * 60_000, max: 12, message: 'Too many code attempts — request a new code.' });
+const limitChat = rateLimit({ windowMs: 60_000, max: 30, message: 'Too many chat requests — slow down.' });
+const limitMedia = rateLimit({ windowMs: 60_000, max: 20, message: 'Too many media requests — slow down.' });
+const limitTools = rateLimit({ windowMs: 60_000, max: 60, message: 'Too many tool requests — slow down.' });
 
 // CORS + preflight — locked to known frontends (was '*' with Bearer auth, see audit P3).
 const ALLOWED_ORIGINS = new Set([
@@ -67,7 +116,10 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.static('.', { etag: false, maxAge: 0, setHeaders: (res) => { res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate'); } }));
+// NOTE: no express.static('.') here on purpose — serving the working directory
+// would expose server.js, package.json and users.json (bcrypt hashes, emails)
+// at the public URL. The frontend deploys separately (GitHub Pages); this
+// backend serves API only.
 
 const PROVIDERS = {
   openrouter: { urls: ['https://openrouter.ai/api/v1'], keys: [process.env.OPENROUTER_KEY, process.env.OPENROUTER_KEY_2].filter(Boolean) },
@@ -90,7 +142,8 @@ const PROVIDERS = {
 function sanityCheckKeys() {
   for (const [name, cfg] of Object.entries(PROVIDERS)) {
     for (const k of cfg.keys) {
-      if (!k || k.length < 10) console.warn(`[Startup] ⚠️  ${name} key looks empty/too short: "${k}"`);
+      // Log presence/length only — never key material.
+      if (!k || k.length < 10) console.warn(`[Startup] ${name} key missing or too short (len=${(k || '').length})`);
     }
   }
 }
@@ -526,6 +579,15 @@ function moderateOutput(text) {
 const moderationLog = {};
 const RATE_LIMIT_WINDOW = 5 * 60 * 1000;
 const RATE_LIMIT_THRESHOLD = 3;
+// Evict stale IP keys so the log can't grow unbounded over process lifetime.
+setInterval(() => {
+  const cutoff = Date.now() - RATE_LIMIT_WINDOW;
+  for (const ip of Object.keys(moderationLog)) {
+    const arr = (moderationLog[ip] || []).filter(e => e.time >= cutoff);
+    if (arr.length) moderationLog[ip] = arr;
+    else delete moderationLog[ip];
+  }
+}, 60_000).unref();
 function logModeration(ip, category) {
   if (!moderationLog[ip]) moderationLog[ip] = [];
   moderationLog[ip].push({ time: Date.now(), category });
@@ -671,7 +733,9 @@ function classifyIntent(messages) {
   // 0. Self-contained tasks: code, creative, math — never search, even if they
   // mention version numbers/APIs. These are answered from knowledge directly.
   // Keep this BEFORE any search trigger so code like "generate HTML for ..." stays local.
-  const looksLikeCodeTask = /```|<\s*\/?(html|head|body|div|span|section|main|header|footer|nav|button|input|form|canvas|svg|style|script)\b|function\s+\w+\s*\(|const\s+\w+\s*=|let\s+\w+\s*=|class\s+\w+|import\s+.*from\s+['"]|console\.|document\.|window\.|npm\s+(install|run)|yarn\s+add|git\s+|fix\s+(this\s+)?bug|stack\s*trace|error\s*:\s*\w+|refactor|tailwind|bootstrap|react|vue|angular|svelte|next\.js/i.test(text)
+  // NOTE: bare framework names (react/vue/...) are NOT markers — "latest
+  // stable version of React" must still reach the temporal check below.
+  const looksLikeCodeTask = /```|<\s*\/?(html|head|body|div|span|section|main|header|footer|nav|button|input|form|canvas|svg|style|script)\b|function\s+\w+\s*\(|const\s+\w+\s*=|let\s+\w+\s*=|class\s+\w+|import\s+.*from\s+['"]|console\.|document\.|window\.|npm\s+(install|run)|yarn\s+add|git\s+|fix\s+(this\s+)?bug|stack\s*trace|error\s*:\s*\w+|refactor/i.test(text)
     && /\b(code|html|css|javascript|typescript|js|ts|python|react|component|function|class|api|endpoint|hook|props|render|debug|bug|refactor|build|create|generate|implement|write|convert|style|design|clone|flappy|game|website|web\s*app)\b/i.test(text);
   const looksLikeCodeGeneration = /\b(generate|create|write|build|implement|make|clone|draw|render|style|design)\b.*\b(html|css|js|javascript|typescript|python|react|component|website|web\s*app|page|game|flappy|canvas|tailwind)\b/i.test(text)
     || /\b(html|css|js|javascript)\b.*\b(code|page|component|file)\b/i.test(text)
@@ -701,16 +765,16 @@ function classifyIntent(messages) {
   // that the model's training data can't provide. Don't require a second
   // keyword â€” the temporal word alone is sufficient.
   const temporalPatterns = [
-    /\bcurrently\b/, /\bcurrent\b/, /\bright now\b/, /\bas of now\b/,
+    /\bcurrently\b/, /\bcurrent\b/, /\bas of now\b/, /\bas of today\b/,
     /\btoday\b/, /\btonight\b/, /\bthis morning\b/, /\bthis week\b/,
     /\bthis month\b/, /\bthis year\b/, /\blatest\b/, /\brecent\b/,
     /\brecently\b/, /\blately\b/, /\bnewest\b/, /\bup to date\b/,
-    /\bjust (now|happened|came out|announced|released)\b/,
-    /\bbreaking\b/, /\bnow\b(?! ?a | ?an )/,  // "now" but not "now a days"
-    /\bwho is (currently|now)\b/, /\bwhat is (currently|now)\b/,
+    /\bjust (happened|came out|announced|released)\b/,
+    /\bbreaking\b/,
+    /\bwho is currently\b/, /\bwhat is currently\b/,
     /\bwho is the current\b/, /\bwhat is the current\b/,
     /\bcurrent (ceo|owner|president|leader|champion|holder|winner|ranking|price|version|status)\b/,
-    /\bwho won\b/, /\bwho is leading\b/, /\bwho is leading\b/,
+    /\bwho won\b/, /\bwho is leading\b/,
   ];
   for (const p of temporalPatterns) {
     if (p.test(text)) {
@@ -718,10 +782,20 @@ function classifyIntent(messages) {
     }
   }
 
-  // 3. Time-sensitive subjects â€” even without explicit temporal words,
-  // some subjects are inherently time-sensitive (prices, rankings, news)
-  const timeSensitiveSubjects = /\b(price|cost|how much|stock|weather|score|news|update|version|release|patch|status|live|election|result|winner|champion|rank(?:ing)?s?|richest|wealthiest|billionaire|net worth|forbes|market cap|gdp|population|unemployment|inflation rate)\b/i;
-  if (timeSensitiveSubjects.test(text)) {
+  // 3. Time-sensitive subjects, split in two:
+  //  (a) inherently current — search on sight (prices, markets, weather…);
+  //  (b) everyday-vocabulary words (news/update/status/version/live/release)
+  //  that also appear in ordinary chat ("update this code", "what version of
+  //  this function") — these need a current-info companion word, otherwise
+  //  the model (which always has search tools) decides for itself.
+  const looksLikeCode = /```|<\s*\/?(html|head|body|div|span|section|main|header|footer|nav|button|input|form|canvas|svg|style|script)\b|function\s+\w+\s*\(|const\s+\w+\s*=|let\s+\w+\s*=|class\s+\w+|import\s+.*from\s+['"]|console\.|document\.|window\.|npm\s+(install|run)|yarn\s+add|git\s+/i.test(text);
+  const alwaysCurrent = /\b(price|cost|how much|stock|weather|score|election|result|winner|champion|rank(?:ing)?s?|richest|wealthiest|billionaire|net worth|forbes|market cap|gdp|population|unemployment|inflation rate)\b/i;
+  if (alwaysCurrent.test(text)) {
+    return { mode: 'web', reason: 'time_sensitive_subject' };
+  }
+  const needsCompanion = /\b(news|updates?|status|live|releases?|versions?|patch)\b/i.test(text);
+  const hasCompanion = /\b(today|tonight|current|currently|latest|recent|recently|new|newest|this\s+(week|month|year)|announced|released|just|breaking|as of)\b/i.test(text);
+  if (needsCompanion && hasCompanion && !looksLikeCode) {
     return { mode: 'web', reason: 'time_sensitive_subject' };
   }
 
@@ -749,20 +823,11 @@ function classifyIntent(messages) {
     return { mode: 'web', reason: 'recent_events' };
   }
 
-  // 8. Character/entity identification â€” user mentions specific names
-  const entityQuestion = /\b(who (is|are|was|were) |who('?s| is) )([a-z]+(?:\s+[a-z]+)?)\b/i;
-  const vsQuestion = /\b([a-z]+)\s+(?:vs?\.?|or|versus)\s+([a-z]+)\s+(who (would|will|could) (win|lose)|who('?s| is) (stronger|faster|better))\b/i;
-  const whoWouldWin = /\bwho (would|will|could|can) (win|lose|bea?t?|defeat)\b.*\b(in a|vs|versus|or)\b/i;
-  const xOrYWhoWouldWin = /\b([a-z]{2,})\s+or\s+([a-z]{2,})\s+who (would|will|could|can) (win|lose|fight)\b/i;
-  if (entityQuestion.test(text) || vsQuestion.test(text) || whoWouldWin.test(text) || xOrYWhoWouldWin.test(text)) {
-    return { mode: 'web', reason: 'entity_identification' };
-  }
-
-  // 9. "Who created/made X" â€” might need to look up the creator/origin
-  const whoCreated = /\bwho (created|made|designed|invented|wrote|directed|developed)\b/i;
-  if (whoCreated.test(text)) {
-    return { mode: 'web', reason: 'creator_lookup' };
-  }
+  // 8-9. REMOVED (2026-09): entity-identification and creator-lookup used to
+  // force a search on any "who is X" / "who made Y" — including fictional,
+  // historical, and settled questions ("Who is Sherlock Holmes?", "who wrote
+  // Romeo and Juliet"). The model always has search tools and judges these
+  // itself now; the checklist only fires on slam-dunk current-info signals.
 
   // Default: normal conversation â€” no search needed
   return { mode: 'normal' };
@@ -1155,14 +1220,23 @@ function htmlToText(html) {
   return t.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
 }
 async function fetchPageText(url) {
-  let host = '';
-  try { host = new URL(url).hostname; } catch { throw new Error('Bad URL'); }
-  const addrs = await dns.lookup(host, { all: true }).catch(() => []);
-  if (!addrs.length || addrs.some(a => isPrivateIP(a.address))) throw new Error('Blocked host');
-  const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(new Error('Page fetch timed out')), 12000);
-  try {
-    const r = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LucaAI/2.0', 'Accept': 'text/html,*/*' }, redirect: 'follow' });
+  // SSRF-safe fetch: redirect:'manual' + per-hop DNS revalidation. A single
+  // pre-check is bypassable via DNS rebinding and unchecked redirect targets
+  // (e.g. -> http://169.254.169.254/ cloud metadata), so every hop is checked.
+  const HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LucaAI/2.0', 'Accept': 'text/html,*/*' };
+  const checkedFetch = async (target, ms) => {
+    let u;
+    try { u = new URL(target); } catch { throw new Error('Bad URL'); }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('Blocked URL scheme');
+    const addrs = await dns.lookup(u.hostname, { all: true }).catch(() => []);
+    if (!addrs.length || addrs.some(a => isPrivateIP(a.address))) throw new Error('Blocked host');
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(new Error('Page fetch timed out')), ms);
+    try {
+      return await fetch(target, { signal: ctrl.signal, headers: HEADERS, redirect: 'manual' });
+    } finally { clearTimeout(to); }
+  };
+  const readBody = async (r, originalUrl) => {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const ct = (r.headers.get('content-type') || '').toLowerCase();
     if (ct && !/text|html|xml|json/.test(ct)) throw new Error('Not a readable page');
@@ -1173,21 +1247,30 @@ async function fetchPageText(url) {
     if (tm) title = htmlToText(tm[1]).slice(0, 200);
     const text = ct.includes('json') ? html.slice(0, 12000) : htmlToText(html).slice(0, 12000);
     if (!text) throw new Error('No readable text found');
-    return { url, title, text };
-  } catch (e) {
-    if (String(e && e.message || '').includes('timed out')) {
-      // One retry on timeout only.
-      const ctrl2 = new AbortController();
-      const to2 = setTimeout(() => ctrl2.abort(new Error('Page fetch timed out')), 12000);
-      try {
-        const r = await fetch(url, { signal: ctrl2.signal, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) LucaAI/2.0', 'Accept': 'text/html,*/*' }, redirect: 'follow' });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const html = await r.text();
-        return { url, title: '', text: htmlToText(html).slice(0, 12000) };
-      } finally { clearTimeout(to2); }
+    return { url: originalUrl, title, text };
+  };
+  let target = url;
+  let r = null;
+  for (let hop = 0; hop < 4; hop++) {
+    try {
+      r = await checkedFetch(target, 12000);
+    } catch (e) {
+      if (String((e && e.message) || '').includes('timed out') && hop === 0) {
+        // One retry on timeout only (first hop).
+        r = await checkedFetch(target, 12000);
+      } else throw e;
     }
-    throw e;
-  } finally { clearTimeout(to); }
+    if (r.status >= 300 && r.status < 400) {
+      const loc = r.headers.get('location');
+      if (!loc) throw new Error(`HTTP ${r.status}`);
+      try { target = new URL(loc, target).toString(); }
+      catch { throw new Error('Bad redirect'); }
+      await r.arrayBuffer().catch(() => {});
+      continue;
+    }
+    return readBody(r, url);
+  }
+  throw new Error('Too many redirects');
 }
 async function executeTool(name, input) {
   const v = validateToolArgs(name, input);
@@ -1867,7 +1950,7 @@ async function chatOnce(c, messages, tier, tools, userSettings, effort, webConte
       }
       if (!text && !toolCalls) throw new Error(`${c.provider} empty`);
       return { text: scrubIdentityLeaks(text, tier, noIdentityScrub), tool_calls: toolCalls };
-    } catch (e) { if (!firstErr) firstErr = e; }
+    } catch (e) { if (!firstErr) firstErr = e; if (isFatalProviderError(e)) throw firstErr; }
   }
   throw firstErr || new Error('no attempt');
 }
@@ -1889,7 +1972,7 @@ async function streamOnce(c, messages, tier, tools, externalSignal, userSettings
       if (c.provider === 'google') {
         // Use true streaming endpoint — previous impl buffered full response (5s gap) then faked SSE
         const encModel = encodeURIComponent(c.model);
-        const streamUrl = `${url}/models/${encModel}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`;
+        const streamUrl = `${url}/models/${encModel}:streamGenerateContent?alt=sse`;
         const r = await fetch(streamUrl, {
           method: 'POST', signal,
           headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
@@ -1959,66 +2042,25 @@ async function streamOnce(c, messages, tier, tools, externalSignal, userSettings
       // If our external abort fired (another hedge won the race), propagate immediately.
       if (externalSignal && externalSignal.aborted) throw e;
       if (!firstErr) firstErr = e;
+      if (isFatalProviderError(e)) throw firstErr;
     }
   }
   throw firstErr || new Error('no attempt');
 }
 
-// Currently always 'high'; classifier logic retained for future use.
-const EFFORT_CLASSIFIER_TIMEOUT_MS = 3500;
-const VALID_EFFORTS = new Set(['low', 'medium', 'high']);
-const EFFORT_THINKING_BUDGET = { low: 1024, medium: 4096, high: 32768 };
-function effortToBudget(effort) { return EFFORT_THINKING_BUDGET[effort] || EFFORT_THINKING_BUDGET.high; }
-
-// Pick a fast flash-tier model for the effort classifier.
-function pickClassifierCandidate() {
-  const flashCandidates = (MODEL_TIERS['flash'] || []).filter(c => c.priority === 'genius' || c.priority === 'smart');
-  const pool = (flashCandidates.length ? flashCandidates : (MODEL_TIERS['flash'] || [])).filter(c => providerAvailable(c.provider, 'flash'));
-  return pool[0] || (MODEL_TIERS['flash'] || [])[0] || null;
+// Non-retryable provider errors: malformed requests and dead URLs. Trying
+// every mirror URL and key for these can never succeed — fail fast instead of
+// multiplying one bad request into N failed calls. 401/403 stay retryable
+// (a rejected key or Cloudflare challenge may pass on the next key/URL),
+// as do 429/408.
+function isFatalProviderError(e) {
+  const msg = String((e && e.message) || '');
+  if (/Just a moment|cloudflare/i.test(msg)) return false;
+  return /\b(400|404|410|422)\b/.test(msg) && !/429|408/.test(msg);
 }
-
-async function classifyThinkingEffort(messages) {
-  const candidate = pickClassifierCandidate();
-  if (!candidate) return 'high';
-  const lastUser = [...messages].reverse().find(m => m.role === 'user');
-  const text = lastUser ? textOf(lastUser.content) : '';
-  if (!text || text.trim().length < 2) return 'medium';
-
-  const prompt = `Classify how much reasoning effort is needed to answer the user request below well. Reply with EXACTLY one word â€” "low", "medium", or "high" â€” nothing else, no punctuation, no explanation.
-
-low = simple factual question, greeting, casual chat, basic formatting/translation/lookup
-medium = an everyday question or task â€” normal writing help, simple-to-moderate code, everyday advice
-high = hard math/logic, non-trivial or multi-file code, deep analysis, tricky debugging, anything that needs careful multi-step reasoning to get right
-
-User request:
-"""${text.slice(0, 1500)}"""
-
-One word answer:`;
-
-  const classifyPromise = chatOnce(candidate, [{ role: 'user', content: prompt }], 'flash', null, null)
-    .then(({ text: raw }) => {
-      const word = String(raw || '').trim().toLowerCase().replace(/[^a-z]/g, '');
-      if (VALID_EFFORTS.has(word)) return word;
-      if (word.includes('high')) return 'high';
-      if (word.includes('low')) return 'low';
-      if (word.includes('med')) return 'medium';
-      return 'medium';
-    });
-  const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(null), EFFORT_CLASSIFIER_TIMEOUT_MS));
-
-  try {
-    const result = await Promise.race([classifyPromise, timeoutPromise]);
-    if (result === null) {
-      console.warn(`[Router] ðŸ§  Thinking-effort classifier (${candidate.model}@${candidate.provider}) too slow â€” defaulting to high`);
-      return 'high';
-    }
-    return result;
-  } catch (e) {
-    console.warn(`[Router] ðŸ§  Thinking-effort classifier failed (${e.message}) â€” defaulting to high`);
-    return 'high';
-  }
-}
-
+// Note: classifyEffortFast (heuristic) is the live effort path; the LLM-based
+// classifyThinkingEffort was dead code (zero call sites) and was removed.
+// can never silently burn a paid call. See git history if it is ever revived.
 app.get('/api/models', (_req, res) => {
   const flat = [];
   for (const tier of Object.keys(MODEL_TIERS)) {
@@ -2146,7 +2188,7 @@ app.get('/api/test', authMiddleware, requireAdmin, async (req, res) => {
 
 // Benchmark endpoint: test each model N times and compute avg speed
 // GET /api/benchmark?tier=flash&runs=5  or ?tier=all&runs=5
-app.get('/api/benchmark', async (req, res) => {
+app.get('/api/benchmark', authMiddleware, requireAdmin, async (req, res) => {
   const tierQ = String(req.query.tier || 'flash').toLowerCase();
   const runs = Math.max(5, Math.min(10, parseInt(String(req.query.runs || '5')) || 5));
   const tiersToTest = tierQ === 'all' ? Object.keys(MODEL_TIERS) : [tierQ];
@@ -2201,7 +2243,7 @@ app.get('/api/benchmark', async (req, res) => {
 
 // Coding benchmark: Flappy Bird single-file HTML clone
 // Tests each unique model with a demanding coding prompt and scores output
-app.get('/api/benchmark/coding', async (req, res) => {
+app.get('/api/benchmark/coding', authMiddleware, requireAdmin, async (req, res) => {
   req.setTimeout(600000); // 10 min for coding benchmark
   const filterTier = String(req.query.tier || '').toLowerCase();
   const filterProvider = String(req.query.provider || '').toLowerCase();
@@ -2298,7 +2340,7 @@ app.get('/api/benchmark/coding', async (req, res) => {
 });
 
  // Live view of the circuit-breaker state. Hit http://localhost:3000/api/health/providers
-app.get('/api/health/providers', (_req, res) => {
+app.get('/api/health/providers', authMiddleware, requireAdmin, (_req, res) => {
   const out = {};
   for (const name of Object.keys(PROVIDERS)) {
     const h = providerHealth[name] || { fails: 0, lastFail: 0 };
@@ -2312,7 +2354,7 @@ app.get('/api/health/providers', (_req, res) => {
 });
 
 // Live view of per-model reliability scores. Hit http://localhost:3000/api/health/scores
-app.get('/api/health/scores', (_req, res) => {
+app.get('/api/health/scores', authMiddleware, requireAdmin, (_req, res) => {
   const out = [];
   for (const [key, s] of Object.entries(modelStats)) {
     const [model, provider] = key.split('@');
@@ -2574,7 +2616,7 @@ app.post('/api/settings/update', async (req, res) => {
   }
 });
 
-app.post('/api/tools/search', async (req, res) => {
+app.post('/api/tools/search', limitTools, async (req, res) => {
   try {
     const query = (req.body && req.body.query) || '';
     if (!query.trim()) return res.status(400).json({ error: 'No query provided' });
@@ -2585,7 +2627,7 @@ app.post('/api/tools/search', async (req, res) => {
   }
 });
 
-app.post('/api/tools/images', async (req, res) => {
+app.post('/api/tools/images', limitTools, async (req, res) => {
   try {
     const query = (req.body && req.body.query) || '';
     if (!query.trim()) return res.status(400).json({ error: 'No query provided' });
@@ -2651,7 +2693,7 @@ async function agnesGenerateImage(prompt, size) {  const agnesKey = process.env.
   throw lastErr;
 }
 
-app.post('/api/generate-image', async (req, res) => {
+app.post('/api/generate-image', limitMedia, async (req, res) => {
   try {
     const { prompt, size } = req.body || {};
     if (!prompt || !prompt.trim()) return res.status(400).json({ error: 'No prompt provided' });
@@ -3059,7 +3101,18 @@ import { readFileSync as readFileSyncSync, writeFileSync, existsSync } from 'fs'
 import { resolve as resolvePath } from 'path';
 import crypto from 'crypto';
 
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+const JWT_SECRET = (() => {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  // Fail fast in production: a random secret silently invalidates every
+  // session on restart (and splits instances behind a load balancer).
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('FATAL: JWT_SECRET is not set. Refusing to start.');
+  }
+  console.error('[Startup] WARNING: JWT_SECRET unset — using an ephemeral secret (dev only, sessions die on restart).');
+  return crypto.randomBytes(32).toString('hex');
+})();
+// Timing-fallback hash so missing accounts take the same bcrypt time as real ones.
+const DUMMY_HASH = '$2a$10$Yxt0K9gaKcoZLZD.MPfODOLxWTls7FiQKPp5Il4Bvd3i2cIwe4jBK';
 const USERS_FILE = resolvePath(process.cwd(), 'users.json');
 const USER_DATA_FILE = resolvePath(process.cwd(), 'user-data.json');
 const OAUTH_REDIRECT = process.env.OAUTH_REDIRECT || 'https://luca-ai-iozy.onrender.com';
@@ -3144,6 +3197,8 @@ function verifyToken(token) {
 function findOrResurrectUser(decoded) {
   if (!decoded || !decoded.id) return null;
   let user = users.find(u => u.id === decoded.id);
+  // Banned ids stay banned — never resurrect them.
+  if (user && user.banned) return null;
   if (user) return user;
   const email = String(decoded.email || '').toLowerCase();
   const base = email.split('@')[0].replace(/[^a-z0-9_]/g, '') || 'user';
@@ -3169,6 +3224,7 @@ function authMiddleware(req, res, next) {
   if (!decoded) return res.status(401).json({ error: 'Invalid token' });
   req.user = findOrResurrectUser(decoded);
   if (!req.user) return res.status(401).json({ error: 'User not found' });
+  if (req.user.banned) return res.status(403).json({ error: 'Account suspended' });
   next();
 }
 
@@ -3200,7 +3256,7 @@ app.get('/api/auth/check-username', (req, res) => {
 });
 
 // Signup with email/password — creates account but requires verification
-app.post('/api/auth/signup', async (req, res) => {
+app.post('/api/auth/signup', limitAuth, async (req, res) => {
   try {
     const { email, password, name, username } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
@@ -3240,7 +3296,7 @@ app.post('/api/auth/signup', async (req, res) => {
 });
 
 // Verify email code
-app.post('/api/auth/verify', async (req, res) => {
+app.post('/api/auth/verify', limitOTP, async (req, res) => {
   try {
     const { email, code } = req.body || {};
     if (!email || !code) return res.status(400).json({ error: 'Email and code required' });
@@ -3251,7 +3307,15 @@ app.post('/api/auth/verify', async (req, res) => {
       delete pendingSignups[email.toLowerCase()];
       return res.status(400).json({ error: 'Verification code expired. Please sign up again.' });
     }
-    if (pending.code !== code) return res.status(400).json({ error: 'Invalid verification code' });
+    if (pending.code !== code) {
+      // 6-digit codes are brute-forceable — lock after a few misses.
+      pending.tries = (pending.tries || 0) + 1;
+      if (pending.tries > 5) {
+        delete pendingSignups[email.toLowerCase()];
+        return res.status(429).json({ error: 'Too many wrong codes — please sign up again for a fresh code.' });
+      }
+      return res.status(400).json({ error: 'Invalid verification code' });
+    }
 
     // Create the verified user
     const user = {
@@ -3276,7 +3340,7 @@ app.post('/api/auth/verify', async (req, res) => {
 });
 
 // Resend verification code
-app.post('/api/auth/resend', async (req, res) => {
+app.post('/api/auth/resend', limitOTP, async (req, res) => {
   try {
     const { email } = req.body || {};
     const pending = pendingSignups[email?.toLowerCase()];
@@ -3296,7 +3360,7 @@ app.post('/api/auth/resend', async (req, res) => {
 const pendingResets = {};
 
 // Forgot password — always returns ok so addresses can't be enumerated
-app.post('/api/auth/forgot', async (req, res) => {
+app.post('/api/auth/forgot', limitAuth, async (req, res) => {
   try {
     const { email } = req.body || {};
     const lower = String(email || '').toLowerCase().trim();
@@ -3315,7 +3379,7 @@ app.post('/api/auth/forgot', async (req, res) => {
 });
 
 // Reset password with emailed code
-app.post('/api/auth/reset', async (req, res) => {
+app.post('/api/auth/reset', limitOTP, async (req, res) => {
   try {
     const { email, code, password } = req.body || {};
     const lower = String(email || '').toLowerCase().trim();
@@ -3327,7 +3391,14 @@ app.post('/api/auth/reset', async (req, res) => {
       delete pendingResets[lower];
       return res.status(400).json({ error: 'Code expired. Please request a new one.' });
     }
-    if (pending.code !== String(code).trim()) return res.status(400).json({ error: 'Invalid code' });
+    if (pending.code !== String(code).trim()) {
+      pending.tries = (pending.tries || 0) + 1;
+      if (pending.tries > 5) {
+        delete pendingResets[lower];
+        return res.status(429).json({ error: 'Too many wrong codes — please request a new one.' });
+      }
+      return res.status(400).json({ error: 'Invalid code' });
+    }
     const user = users.find(u => u.email.toLowerCase() === lower);
     if (!user) return res.status(400).json({ error: 'Account not found' });
     user.password = bcrypt.hashSync(password, 10);
@@ -3340,14 +3411,19 @@ app.post('/api/auth/reset', async (req, res) => {
 });
 
 // Login with email/password (accepts email or username)
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', limitAuth, async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'Email or username and password required' });
 
     const lower = email.toLowerCase();
     const user = users.find(u => u.email === lower || u.username === lower);
-    if (!user || !user.password) return res.status(401).json({ error: 'Invalid credentials' });
+    // Timing-safe: always run a bcrypt compare so missing accounts don't
+    // answer faster than existing ones (account-enumeration side channel).
+    if (!user || !user.password) {
+      bcrypt.compareSync(String(password), DUMMY_HASH);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     if (!bcrypt.compareSync(password, user.password)) {
       return res.status(401).json({ error: 'Invalid credentials' });
@@ -3384,12 +3460,34 @@ function originFromState(state) {
     return safeRedirectOrigin(Buffer.from(parts[1], 'base64url').toString('utf8'));
   } catch { return null; }
 }
+// OAuth login-CSRF binding: the state nonce is mirrored into an httpOnly
+// cookie at flow start and must match at the callback (same browser).
+const OAUTH_DEMO = process.env.DEMO_MODE === '1';
+function oauthStateCookie(res, state) {
+  const secure = /^https:/i.test(OAUTH_REDIRECT || '');
+  res.cookie('oauth_state', state, { httpOnly: true, sameSite: 'lax', secure, maxAge: 10 * 60 * 1000, path: '/' });
+}
+function oauthStateMatches(req) {
+  try {
+    const cookies = String(req.headers.cookie || '').split(';').map(s => s.trim());
+    const jar = cookies.find(s => s.startsWith('oauth_state='));
+    if (!jar) return false;
+    const a = decodeURIComponent(jar.slice('oauth_state='.length)).split('.')[0];
+    const b = String(req.query.state || '').split('.')[0];
+    if (!a || !b || a.length < 8 || b.length < 8 || a.length !== b.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  } catch { return false; }
+}
+function clearOauthState(res) { try { res.clearCookie('oauth_state', { path: '/' }); } catch {} }
 
 app.get('/api/auth/google', (req, res) => {
   const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID || '';
   const redirectUri = `${OAUTH_REDIRECT}/api/auth/google/callback`;
   const back = redirectTarget(req);
   if (!clientId) {
+    // No silent mock accounts in production: a missing client ID is a
+    // misconfiguration, not a demo. Opt into mocks with DEMO_MODE=1.
+    if (!OAUTH_DEMO) return res.status(503).send('Google OAuth not configured');
     // Demo mock: create a unique mock Google user so the button actually works without real OAuth
     const mockEmail = `mock-google-${Date.now()}-${Math.floor(Math.random() * 10000)}@example.com`;
     const user = {
@@ -3407,6 +3505,7 @@ app.get('/api/auth/google', (req, res) => {
     return res.redirect(`${back}/?auth_token=${token}&auth_name=${encodeURIComponent(user.name)}&auth_username=${encodeURIComponent(user.username)}`);
   }
   const state = stateFor(back);
+  oauthStateCookie(res, state);
   const url = `https://accounts.google.com/o/oauth2/v2/auth?` +
     `client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&` +
     `response_type=code&scope=openid+email+profile&state=${state}`;
@@ -3415,6 +3514,8 @@ app.get('/api/auth/google', (req, res) => {
 
 app.get('/api/auth/google/callback', async (req, res) => {
   const back = originFromState(req.query.state) || FRONTEND_URL;
+  if (!oauthStateMatches(req)) { clearOauthState(res); return res.redirect(`${back}/?auth_error=bad_state`); }
+  clearOauthState(res);
   try {
     const { code } = req.query;
     if (!code) return res.redirect(`${back}/?auth_error=no_code`);
@@ -3472,6 +3573,7 @@ app.get('/api/auth/github', (req, res) => {
   const redirectUri = `${OAUTH_REDIRECT}/api/auth/github/callback`;
   const back = redirectTarget(req);
   if (!clientId) {
+    if (!OAUTH_DEMO) return res.status(503).send('GitHub OAuth not configured');
     // Demo mock: create a unique mock GitHub user so the button actually works without real OAuth
     const mockEmail = `mock-github-${Date.now()}-${Math.floor(Math.random() * 10000)}@example.com`;
     const user = {
@@ -3489,6 +3591,7 @@ app.get('/api/auth/github', (req, res) => {
     return res.redirect(`${back}/?auth_token=${token}&auth_name=${encodeURIComponent(user.name)}&auth_username=${encodeURIComponent(user.username)}`);
   }
   const state = stateFor(back);
+  oauthStateCookie(res, state);
   const url = `https://github.com/login/oauth/authorize?` +
     `client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&` +
     `scope=user:email&state=${state}`;
@@ -3497,6 +3600,8 @@ app.get('/api/auth/github', (req, res) => {
 
 app.get('/api/auth/github/callback', async (req, res) => {
   const back = originFromState(req.query.state) || FRONTEND_URL;
+  if (!oauthStateMatches(req)) { clearOauthState(res); return res.redirect(`${back}/?auth_error=bad_state`); }
+  clearOauthState(res);
   try {
     const { code } = req.query;
     if (!code) return res.redirect(`${back}/?auth_error=no_code`);
@@ -3554,7 +3659,13 @@ app.get('/api/auth/github/callback', async (req, res) => {
   }
 });
 
-const OWNER_EMAILS = ['coal16026@gmail.com'];
+const OWNER_EMAILS = String(process.env.OWNER_EMAIL || process.env.OWNER_EMAILS || 'coal16026@gmail.com')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+if (!process.env.OWNER_EMAIL && !process.env.OWNER_EMAILS) {
+  console.error('[Startup] WARNING: OWNER_EMAIL not set — using built-in fallback owner. Set OWNER_EMAIL in production.');
+}
 function isOwner(user) {
   return !!(user && (user.username === 'coal' || OWNER_EMAILS.includes(String(user.email || '').toLowerCase())));
 }
@@ -3645,7 +3756,7 @@ app.get('/api/admin/users', authMiddleware, requireAdmin, (req, res) => {
 app.put('/api/admin/users/:userId', authMiddleware, requireAdmin, (req, res) => {
   const user = users.find(u => u.id === req.params.userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
-  const { isAdmin, verified, badge, modelOverride } = req.body || {};
+  const { isAdmin, verified, badge, modelOverride, banned } = req.body || {};
   // Owner keeps admin implicitly (isOwner); never allow demoting the last explicit admin.
   if (typeof isAdmin === 'boolean' && (isAdmin === true || !isOwner(user))) {
     if (isAdmin === false && !users.some((u) => u.id !== user.id && isAdminUser(u))) {
@@ -3654,6 +3765,11 @@ app.put('/api/admin/users/:userId', authMiddleware, requireAdmin, (req, res) => 
     user.isAdmin = isAdmin;
   }
   if (typeof verified === 'boolean') user.verified = verified;
+  // Suspension: banned ids are rejected in authMiddleware and never resurrected.
+  if (typeof banned === 'boolean') {
+    if (banned && isOwner(user)) return res.status(400).json({ error: 'Cannot suspend the owner account' });
+    user.banned = banned;
+  }
   // Admin model routing: 'flash' | 'pro' | 'provider/model' | null
   if (modelOverride !== undefined) {
     if (modelOverride === null || modelOverride === '') {
@@ -3886,7 +4002,7 @@ function detectImageIntent(messages) {
   return null;
 }
 
-app.post('/api/edit-image', async (req, res) => {
+app.post('/api/edit-image', limitMedia, async (req, res) => {
   try {
     const { prompt, image } = req.body || {};
     if (!prompt || !prompt.trim()) return res.status(400).json({ error: 'No prompt provided' });
@@ -3940,13 +4056,38 @@ app.post('/api/edit-image', async (req, res) => {
   }
 });
 
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', limitChat, async (req, res) => {
   try {
     const body = req.body || {};
     let messages = normalizeMessages(body);
     if (!messages.length) return res.status(400).json({ error: 'No message received' });
+    // Bound per-request cost: slice to recent turns + a hard character budget.
+    // (The 10MB body cap alone still allows huge billable histories.)
+    if (messages.length > 60) messages = messages.slice(-60);
+    let totalChars = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      totalChars += textOf(messages[i].content).length;
+      if (totalChars > 300_000) { messages = messages.slice(i + 1); break; }
+    }
+    if (!messages.length) return res.status(400).json({ error: 'Message too large' });
 
-    const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress;
+    // Real input firewall (was a stub returning allow): block instruction
+    // override / jailbreak / banned-content prompts before any provider spend.
+    try {
+      const lastUser = [...messages].reverse().find(m => m.role === 'user');
+      const rawText = textOf(lastUser ? lastUser.content : '');
+      const decision = classifyInput(normalizeForSecurity(rawText), rawText);
+      if (decision.action === 'block') {
+        logModeration(req.ip, decision.categories[0] || 'blocked');
+        if (isRateLimited(req.ip)) {
+          return res.status(429).json({ error: 'Too many flagged requests — slow down.' });
+        }
+        return res.status(403).json({ error: 'That request isn\u2019t allowed.' });
+      }
+      if (decision.action !== 'allow') logModeration(req.ip, decision.categories[0] || 'flagged');
+    } catch {}
+
+    const clientIp = req.ip || req.socket.remoteAddress;
 
     const imageIntent = detectImageIntent(messages);
     if (imageIntent) {
